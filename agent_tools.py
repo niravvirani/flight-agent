@@ -831,3 +831,8 @@ if __name__ == "__main__":
     print("\n" + "="*60 + "\n")
     result = run_flight_agent(query)
     print(result)
+
+# Transfer partners integration
+from transfer_partners import get_transfer_partners, TRANSFER_PARTNERS_SCHEMA
+TOOL_REGISTRY["get_transfer_partners"] = get_transfer_partners
+TOOL_SCHEMAS_ANTHROPIC.append(TRANSFER_PARTNERS_SCHEMA)
