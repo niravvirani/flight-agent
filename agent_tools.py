@@ -76,7 +76,7 @@ except Exception:
     CACHE_AVAILABLE = False
     print("Warning: Redis not available. Caching disabled.")
 
-CACHE_TTL_SECONDS = 900  # 15 minutes
+CACHE_TTL_SECONDS = 180  # 3 minutes
 
 
 def _cache_get(key: str):
@@ -202,17 +202,17 @@ def search_cash_flights(
                     "arrival_datetime": last_leg.get("arrival_airport", {}).get("time"),
                     "stops": len(itinerary) - 1,
                     "cabin": cabin_class,
-                    "booking_url": f"https://www.google.com/travel/flights",
+                    "booking_url": f"https://www.kayak.com/flights/{origin}-{destination}/{departure_date}?sort=price_a&fs=cabinclass={'f' if cabin_class == 'first' else 'b' if cabin_class == 'business' else 'p' if cabin_class == 'premium_economy' else 'e'}",
                     "date_searched": date,
                 })
 
     # Sort by price ascending, deduplicate
     results = sorted(
         [r for r in results if r.get("price_usd")],
-        key=lambda x: x["price_usd"]
+        key=lambda x: (x.get("stops", 99), x["price_usd"])
     )
 
-    output = {"origin": origin, "destination": destination, "results": results[:10]}
+    output = {"origin": origin, "destination": destination, "results": results[:20]}
     _cache_set(cache_key, output)
     return output
 
@@ -401,6 +401,7 @@ def _search_seats_aero(origin, destination, departure_date, programs,
                     "cabin": cabin_class,
                     "airline": avail.get(f"{prefix}Airlines", "Unknown"),
                     "availability": "available",
+                    "direct": avail.get(f"{prefix}Direct", True) and len(avail.get(f"{prefix}Airlines", "").split(",")) <= 1,
                     "seats_remaining": avail.get(f"{prefix}RemainingSeats", 0),
                     "departure_date": avail.get("Date"),
                     "booking_url": _build_booking_url(
@@ -413,21 +414,36 @@ def _search_seats_aero(origin, destination, departure_date, programs,
     return sorted(results, key=lambda x: x["points_required"])
 
 def _build_booking_url(program: str, origin: str, destination: str, date: str) -> str:
-    """Build a deep link directly to the airline's award booking flow."""
-    urls = {
-        "aeroplan":    f"https://www.aircanada.com/aeroplan/redeem/availability?org0={origin}&dest0={destination}&departureDate0={date}&lang=en-CA",
-        "united":      f"https://www.united.com/en/us/flights/search/results?f={origin}&t={destination}&d={date}&tt=1&sc=7",
-        "delta":       f"https://www.delta.com/us/en/flight-search/search-results?cacheKeySuffix=0&origin={origin}&destination={destination}&departureDate={date}&paxCount=1&cabinClass=coach&tripType=ONE_WAY",
-        "alaska":      f"https://www.alaskaair.com/booking/choose-flights/1/{origin}/{destination}/{date}/1/0/0/ASA/Lowest",
-        "american":    f"https://www.aa.com/booking/search?locale=en_US&pax=1&adult=1&type=OneWay&searchType=Award&cabin=&carriers=AA&outboundDeparts={date}&origin={origin}&destination={destination}",
+    """
+    Links to seats.aero program pages for award bookings.
+    seats.aero supports deep links and shows live availability.
+    For cash options, Kayak is used instead (set in search_cash_flights).
+    """
+    # seats.aero program page URLs - these work and show live award availability
+    seats_aero_programs = {
+        "aeroplan":       "aeroplan",
+        "united":         "united",
+        "delta":          "delta",
+        "alaska":         "alaska",
+        "american":       "american",
+        "flyingblue":     "flyingblue",
+        "virginatlantic": "virginatlantic",
+        "british":        "british",
+        "singapore":      "singapore",
+        "etihad":         "etihad",
+        "emirates":       "emirates",
+        "turkish":        "turkish",
+        "qatar":          "qatar",
+        "qantas":         "qantas",
+        "avianca":        "avianca",
+        "aeromexico":     "aeromexico",
+        "finnair":        "finnair",
     }
-    return urls.get(program, f"https://awardhacker.com/?from={origin}&to={destination}&date={date}")
 
-
-# ═══════════════════════════════════════════════════════════════════
-# TOOL 3 — get_points_valuations
-# Returns current CPP (cents per point) for each loyalty program
-# ═══════════════════════════════════════════════════════════════════
+    prog = seats_aero_programs.get(program)
+    if prog:
+        return f"https://seats.aero/{prog}?origin={origin}&destination={destination}&date={date}"
+    return f"https://seats.aero/search?origin={origin}&destination={destination}&date={date}"
 
 def get_points_valuations(programs: list = None) -> dict:
     """
@@ -526,7 +542,8 @@ def compare_and_recommend(
     """
     valuations = get_points_valuations()["valuations"]
 
-    best_cash = cash_results.get("results", [{}])[0]
+    cash_list = cash_results.get("results", [])
+    best_cash = cash_list[0] if cash_list else {}
     best_cash_price = best_cash.get("price_usd", 0)
 
     ranked = []
@@ -774,7 +791,10 @@ Always state:
 - Whether you recommend cash or points and why
 - A direct booking link"""
 
-    messages = [{"role": "user", "content": user_query}]
+    if conversation_history:
+        messages = conversation_history + [{"role": "user", "content": user_query}]
+    else:
+        messages = [{"role": "user", "content": user_query}]
 
     # ── Agentic loop ─────────────────────────────────────────────
     while True:
@@ -791,10 +811,12 @@ Always state:
 
         # If done, return the final text
         if response.stop_reason == "end_turn":
-            return next(
+            reply = next(
                 (block.text for block in response.content if hasattr(block, "text")),
                 "No response generated."
             )
+            messages.append({"role": "assistant", "content": reply})
+            return reply, messages
 
         # If tool use requested, execute all tool calls
         if response.stop_reason == "tool_use":
