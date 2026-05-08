@@ -62,7 +62,41 @@ CITY_TO_AIRPORT = {
 }
 
 def resolve_airport(code):
-    return CITY_TO_AIRPORT.get(code.upper(), code.upper())
+    """Convert city name or IATA code to airport code using Claude."""
+    cleaned = code.strip()
+    # Check hardcoded map first
+    if cleaned.upper() in CITY_TO_AIRPORT:
+        return CITY_TO_AIRPORT[cleaned.upper()]
+    # If already a valid 3-letter IATA code return as-is
+    if len(cleaned) == 3 and cleaned.isalpha():
+        return cleaned.upper()
+    # Use Claude Haiku to resolve any city name
+    try:
+        _key = os.getenv("ANTHROPIC_API_KEY")
+        if not _key:
+            load_dotenv()
+            _key = os.getenv("ANTHROPIC_API_KEY")
+        _client = anthropic.Anthropic(api_key=_key)
+        _resp = _client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=30,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"What are the IATA airport codes for {cleaned}? "
+                    "If the city has multiple major airports, list all codes separated by commas (e.g. JFK,EWR,LGA). "
+                    "If just one airport, give only the 3-letter code. Reply with codes only, nothing else."
+                )
+            }]
+        )
+        iata = _resp.content[0].text.strip().upper()
+        # Accept either single code or comma-separated list
+        codes = [c.strip() for c in iata.split(",") if len(c.strip()) == 3 and c.strip().isalpha()]
+        if codes:
+            return ",".join(codes)
+    except Exception as e:
+        print(f"resolve_airport error for {cleaned}: {e}")
+    return cleaned.upper()
 
 
 # ─────────────────────────────────────────────
@@ -142,12 +176,14 @@ def search_cash_flights(
         }
     """
     origin = resolve_airport(origin)
+    origin = resolve_airport(origin)
     destination = resolve_airport(destination)
     cache_key = _cache_key("cash", origin, destination, departure_date,
                            return_date, adults, cabin_class, flex_days)
     cached = _cache_get(cache_key)
     if cached:
         return cached
+
 
     results = []
 
@@ -187,8 +223,15 @@ def search_cash_flights(
             }
             params["travel_class"] = cabin_map.get(cabin_class, "1")
 
-            resp = httpx.get("https://serpapi.com/search", params=params, timeout=15)
-            resp.raise_for_status()
+            for _attempt in range(2):
+                try:
+                    resp = httpx.get("https://serpapi.com/search", params=params, timeout=30)
+                    resp.raise_for_status()
+                    break
+                except httpx.ReadTimeout:
+                    if _attempt == 1:
+                        results.append({"error": "Serpapi timeout", "date": date})
+                        continue
             data = resp.json()
 
             for flight in data.get("best_flights", []) + data.get("other_flights", []):
@@ -323,6 +366,10 @@ def search_award_availability(
     if programs is None:
         programs = ["aeroplan", "united", "delta", "alaska", "american"]
 
+    origin = resolve_airport(origin)
+    destination = resolve_airport(destination)
+    origin = resolve_airport(origin)
+    destination = resolve_airport(destination)
     origin = resolve_airport(origin)
     destination = resolve_airport(destination)
     cache_key = _cache_key("award", origin, destination, departure_date,
@@ -858,3 +905,22 @@ if __name__ == "__main__":
 from transfer_partners import get_transfer_partners, TRANSFER_PARTNERS_SCHEMA
 TOOL_REGISTRY["get_transfer_partners"] = get_transfer_partners
 TOOL_SCHEMAS_ANTHROPIC.append(TRANSFER_PARTNERS_SCHEMA)
+
+def search_roundtrip_awards(
+    origin: str,
+    destination: str,
+    departure_date: str,
+    return_date: str,
+    cabin_class: str = "economy",
+    flex_days: int = 3,
+) -> dict:
+    """Runs two one-way award searches and returns outbound + inbound results."""
+    outbound = search_award_availability(
+        origin, destination, departure_date,
+        cabin_class=cabin_class, flex_days=flex_days
+    )
+    inbound = search_award_availability(
+        destination, origin, return_date,
+        cabin_class=cabin_class, flex_days=flex_days
+    )
+    return {"outbound": outbound, "inbound": inbound}

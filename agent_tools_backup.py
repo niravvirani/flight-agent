@@ -223,8 +223,15 @@ def search_cash_flights(
             }
             params["travel_class"] = cabin_map.get(cabin_class, "1")
 
-            resp = httpx.get("https://serpapi.com/search", params=params, timeout=15)
-            resp.raise_for_status()
+            for _attempt in range(2):
+                try:
+                    resp = httpx.get("https://serpapi.com/search", params=params, timeout=30)
+                    resp.raise_for_status()
+                    break
+                except httpx.ReadTimeout:
+                    if _attempt == 1:
+                        results.append({"error": "Serpapi timeout", "date": date})
+                        continue
             data = resp.json()
 
             for flight in data.get("best_flights", []) + data.get("other_flights", []):
@@ -898,3 +905,22 @@ if __name__ == "__main__":
 from transfer_partners import get_transfer_partners, TRANSFER_PARTNERS_SCHEMA
 TOOL_REGISTRY["get_transfer_partners"] = get_transfer_partners
 TOOL_SCHEMAS_ANTHROPIC.append(TRANSFER_PARTNERS_SCHEMA)
+
+def search_roundtrip_awards(
+    origin: str,
+    destination: str,
+    departure_date: str,
+    return_date: str,
+    cabin_class: str = "economy",
+    flex_days: int = 3,
+) -> dict:
+    """Runs two one-way award searches and returns outbound + inbound results."""
+    outbound = search_award_availability(
+        origin, destination, departure_date,
+        cabin_class=cabin_class, flex_days=flex_days
+    )
+    inbound = search_award_availability(
+        destination, origin, return_date,
+        cabin_class=cabin_class, flex_days=flex_days
+    )
+    return {"outbound": outbound, "inbound": inbound}

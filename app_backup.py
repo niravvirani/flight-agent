@@ -6,6 +6,7 @@ from agent_tools import (
     run_flight_agent,
     search_cash_flights,
     search_award_availability,
+    search_roundtrip_awards,
     get_points_valuations,
     compare_and_recommend,
     resolve_airport,
@@ -407,21 +408,34 @@ with tab1:
     if mode == "🔍 Search":
         st.caption("Compare cash vs points — live results with filters.")
 
+        # Trip type toggle OUTSIDE form so it rerenders immediately
+        trip_type = st.radio("Trip type", ["One Way", "Round Trip"], horizontal=True, key="trip_type_radio")
+        is_roundtrip = trip_type == "Round Trip"
+
         with st.form("search_form"):
             c1, c2, c3, c4 = st.columns(4)
             with c1: origin = st.text_input("From (city or code)", value="Boston", max_chars=50).strip()
             with c2: destination = st.text_input("To (city or code)", value="London", max_chars=50).strip()
-            with c3: departure_date = st.date_input("Date", value=datetime.now().date() + timedelta(days=1), min_value=datetime.now().date() + timedelta(days=1))
+            with c3:
+                departure_date = st.date_input("Departure", value=datetime.now().date() + timedelta(days=1), min_value=datetime.now().date() + timedelta(days=1))
             with c4:
                 _cabin_options = ["economy", "business", "first"]
                 _saved = st.session_state.get("submitted_cabin", "economy")
                 cabin = st.selectbox("Cabin", _cabin_options, index=_cabin_options.index(_saved) if _saved in _cabin_options else 0)
+
+            if is_roundtrip:
+                return_date = st.date_input("Return date", value=datetime.now().date() + timedelta(days=8), min_value=datetime.now().date() + timedelta(days=2))
+            else:
+                return_date = None
+
             points = st.text_input("Your points", placeholder="e.g. 80,000 Aeroplan and 45,000 Chase UR")
             submitted = st.form_submit_button("🔍 Search", use_container_width=True)
 
         if submitted or "search_data" in st.session_state:
             if submitted:
-                st.session_state["submitted_cabin"] = st.session_state.get("cabin_select", "economy")
+                st.session_state["submitted_cabin"] = cabin
+                st.session_state["submitted_is_roundtrip"] = is_roundtrip
+                st.session_state["submitted_return_date"] = str(return_date) if return_date else None
                 if "search_data" in st.session_state:
                     del st.session_state["search_data"]
                 if "sort_col" in st.session_state:
@@ -464,14 +478,25 @@ with tab1:
 
 
                     st.session_state["submitted_cabin"] = cabin
+                    _is_rt = is_roundtrip
+                    _return_date = str(return_date) if return_date else None
+
                     cash_results = search_cash_flights(
                         origin, destination, str(departure_date),
-                        cabin_class=cabin, flex_days=3
+                        cabin_class=cabin, flex_days=3,
+                        return_date=_return_date if _is_rt else None
                     )
                     award_results = search_award_availability(
                         origin, destination, str(departure_date),
                         cabin_class=cabin, flex_days=3
                     )
+                    if _is_rt and _return_date:
+                        rt_award_results = search_roundtrip_awards(
+                            origin, destination, str(departure_date), _return_date,
+                            cabin_class=cabin, flex_days=3
+                        )
+                    else:
+                        rt_award_results = None
                     compare_results = compare_and_recommend(cash_results, award_results)
                     ai_thread.join()
 
@@ -483,14 +508,18 @@ with tab1:
                     "origin": origin,
                     "destination": destination,
                     "departure_date": str(departure_date),
-                    "cabin": st.session_state["submitted_cabin"],
+                    "cabin": cabin,
                     "points": points,
+                    "is_roundtrip": _is_rt,
+                    "return_date": _return_date,
+                    "rt_award_results": rt_award_results,
                 }
                 log_search(origin, destination, str(departure_date), cabin, points,
                            ai_result_holder.get("result",""))
 
             # Render from session state
             data = st.session_state.search_data
+            st.caption(f"DEBUG: is_roundtrip={data.get('is_roundtrip')} rt_results={bool(data.get('rt_award_results'))}")
             origin = data["origin"]
             destination = data["destination"]
             departure_date = data["departure_date"]
@@ -652,6 +681,76 @@ with tab1:
                         "selected_dates": selected_dates,
                     }
                 )
+
+                # Round trip award results
+                if data.get("is_roundtrip") and data.get("rt_award_results"):
+                    st.divider()
+                    rt = data["rt_award_results"]
+                    valuations = get_points_valuations()["valuations"]
+
+                    ob_col, ret_col = st.columns(2)
+
+                    with ob_col:
+                        st.markdown(f"#### Outbound: {data['origin']} → {data['destination']}")
+                        ob_results = rt.get("outbound", {}).get("results", [])
+                        if not ob_results:
+                            st.info("No outbound award options found.")
+                        else:
+                            best_cash_price = data["cash"].get("results",[{}])[0].get("price_usd", 0) or 0
+                            for a in ob_results[:8]:
+                                prog = a.get("program","")
+                                pts = a.get("points_required", 0)
+                                taxes = a.get("taxes_usd", 0)
+                                cpp_val = valuations.get(prog, {}).get("cpp", 1.20)
+                                true_val = round((pts * cpp_val / 100) + taxes, 2)
+                                with st.container():
+                                    ca, cb, cc = st.columns([2, 1, 1])
+                                    with ca:
+                                        st.markdown(f"**{prog.title()}** — {a.get('airline','')}")
+                                        st.caption(f"{a.get('departure_date','')} · {a.get('cabin','').title()}")
+                                    with cb:
+                                        st.markdown(f"**{pts:,} pts**")
+                                        st.caption(f"+${taxes:.2f} fees")
+                                    with cc:
+                                        color = "green" if true_val < best_cash_price/2 else "red"
+                                        st.markdown(f"**:{color}[${true_val:,.0f}]**")
+                                        st.caption(f"{cpp_val}¢/pt")
+                                        if a.get("booking_url"):
+                                            st.link_button("Book →", a["booking_url"], use_container_width=True)
+                                st.divider()
+
+                    with ret_col:
+                        st.markdown(f"#### Return: {data['destination']} → {data['origin']}")
+                        ret_results = rt.get("inbound", {}).get("results", [])
+                        if not ret_results:
+                            st.info("No return award options found.")
+                        else:
+                            for a in ret_results[:8]:
+                                prog = a.get("program","")
+                                pts = a.get("points_required", 0)
+                                taxes = a.get("taxes_usd", 0)
+                                cpp_val = valuations.get(prog, {}).get("cpp", 1.20)
+                                true_val = round((pts * cpp_val / 100) + taxes, 2)
+                                with st.container():
+                                    ca, cb, cc = st.columns([2, 1, 1])
+                                    with ca:
+                                        st.markdown(f"**{prog.title()}** — {a.get('airline','')}")
+                                        st.caption(f"{a.get('departure_date','')} · {a.get('cabin','').title()}")
+                                    with cb:
+                                        st.markdown(f"**{pts:,} pts**")
+                                        st.caption(f"+${taxes:.2f} fees")
+                                    with cc:
+                                        color = "green" if true_val < best_cash_price/2 else "red"
+                                        st.markdown(f"**:{color}[${true_val:,.0f}]**")
+                                        st.caption(f"{cpp_val}¢/pt")
+                                        if a.get("booking_url"):
+                                            st.link_button("Book →", a["booking_url"], use_container_width=True)
+                                st.divider()
+
+                    # Mix and match summary
+                    st.markdown("##### Mix and match tip")
+                    st.caption("Pick any outbound program and any return program independently. Values shown are per-leg true dollar cost based on basket CPP + taxes.")
+
 
     # ══ CHAT MODE ═════════════════════════════════════════════════
     else:
